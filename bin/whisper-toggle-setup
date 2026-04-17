@@ -155,14 +155,22 @@ select_model() {
         "base.en"
         "small.en"
         "medium.en"
+        "tiny (multilingual model)"
+        "base (multilingual model)"
+        "small (multilingual model)"
+        "medium (multilingual model)"
         "large-v3-turbo"
         "large-v3"
     )
     local sizes=(
-        "75 MB"
-        "142 MB"
-        "466 MB"
-        "1.5 GB"
+        "43.6 MB"
+        "148 MB"
+        "264 MB"
+        "823 MB"
+        "43.5 MB"
+        "148 MB"
+        "264 MB"
+        "823 MB"
         "1.6 GB"
         "3.1 GB"
     )
@@ -171,6 +179,10 @@ select_model() {
         "ggml-base.en.bin"
         "ggml-small.en.bin"
         "ggml-medium.en.bin"
+        "ggml-tiny.bin"
+        "ggml-base.bin"
+        "ggml-small.bin"
+        "ggml-medium.bin"
         "ggml-large-v3-turbo.bin"
         "ggml-large-v3.bin"
     )
@@ -179,6 +191,10 @@ select_model() {
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin"
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
     )
@@ -194,7 +210,7 @@ select_model() {
         printf "  ${BOLD}%d)${NC} %-22s %10s%b\n" "$((i+1))" "${names[$i]}" "${sizes[$i]}" "$marker"
     done
     echo ""
-    echo -e "  ${DIM}Recommended: small.en (good balance of speed and accuracy)${NC}"
+    echo -e "  ${DIM}Recommended: small (en or multilingual model) (good balance of speed and accuracy)${NC}"
     echo ""
 
     local choice
