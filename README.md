@@ -128,6 +128,7 @@ WHISPER_DEVICE=0               # GPU index (-1 for CPU-only)
 WHISPER_THREADS=4              # CPU threads for inference
 WHISPER_LANGUAGE="en"          # Language code or "auto"
 AUTOPASTE=1                    # Auto-paste after transcription
+PASTE_METHOD="ctrl_v"          # "ctrl_v" or "shift_insert"
 SILENCE_DURATION=3.0           # Seconds of silence before auto-stop
 SILENCE_THRESHOLD=3            # Silence sensitivity (%)
 ```
@@ -201,7 +202,8 @@ Common causes: wrong GPU device index, missing CUDA/Vulkan drivers, model file n
 <summary><b>Nothing pastes</b></summary>
 
 **X11:** Install `xsel` and `xdotool`<br>
-**Wayland:** Install `wl-clipboard` and `ydotool`, ensure `ydotoold` is running
+**Wayland:** Install `wl-clipboard` and `ydotool`, ensure `ydotoold` is running<br>
+If your target app pastes more reliably with `Shift+Insert` (e.g. when using whisper on a terminal), set `PASTE_METHOD="shift_insert"` in your config.
 </details>
 
 <details>
