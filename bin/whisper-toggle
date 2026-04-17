@@ -98,8 +98,8 @@ autopaste() {
     if (( AUTOPASTE )); then
         case "$SESSION_TYPE" in
             wayland)
-                # ydotool keycodes: 37=LCtrl, 55=V (kernel keycodes)
-                ydotool key 37:1 55:1 55:0 37:0
+                # ydotool uses Linux evdev keycodes: 29=LeftCtrl, 47=V
+                ydotool key 29:1 47:1 47:0 29:0
                 ;;
             *)
                 xdotool key ctrl+v
