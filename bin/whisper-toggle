@@ -138,10 +138,14 @@ postprocess() {
     # Strip whisper non-speech markers like (wind blowing) or [BLANK_AUDIO]
     str="${str//(*/}"
     str="${str//[*/}"
-    # Trim leading whitespace and newlines
-    str="$(echo "$str" | sed 's/^[[:space:]]*//')"
+    # Trim leading whitespace
+    str="$(printf '%s' "$str" | sed 's/^[[:space:]]*//')"
+    # Flatten transcript line breaks
+    str="$(printf '%s' "$str" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')"
+    # Remove trailing whitespace
+    str="$(printf '%s' "$str" | sed 's/[[:space:]]*$//')"
     # Capitalize first character
-    str="$(echo "$str" | sed 's/./\U&/')"
+    str="$(printf '%s' "$str" | sed 's/./\U&/')"
     echo "$str"
 }
 
@@ -165,6 +169,7 @@ transcribe_server() {
         --port "$WHISPER_PORT" \
         --device "$WHISPER_DEVICE" \
         -t "$WHISPER_THREADS" \
+        -nt \
         $lang_flag \
         >>"$LOGFILE" 2>&1 &
     local server_pid=$!
