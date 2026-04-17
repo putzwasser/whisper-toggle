@@ -131,7 +131,7 @@ transcribe_server() {
 
     # Start server in background — model loads while user speaks
     local lang_flag=""
-    if [[ "$WHISPER_LANGUAGE" != "auto" ]]; then
+    if [[ "$WHISPER_LANGUAGE" != "" ]]; then
         lang_flag="-l $WHISPER_LANGUAGE"
     fi
     # Start in its own process group (setsid) so keypresses don't SIGINT it
@@ -214,7 +214,7 @@ transcribe_cli() {
     notify "Transcribing..." "low" "audio-x-generic"
 
     local lang_flag=""
-    if [[ "$WHISPER_LANGUAGE" != "auto" ]]; then
+    if [[ "$WHISPER_LANGUAGE" != "" ]]; then
         lang_flag="-l $WHISPER_LANGUAGE"
     fi
 
