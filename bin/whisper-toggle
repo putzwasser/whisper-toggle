@@ -19,6 +19,7 @@ WHISPER_DEVICE=0
 WHISPER_THREADS=4
 WHISPER_LANGUAGE="en"
 AUTOPASTE=1
+PASTE_METHOD="ctrl_v"
 SILENCE_DURATION=3.0
 SILENCE_THRESHOLD=3
 WHISPER_SERVER=""
@@ -87,9 +88,17 @@ clip_copy() {
     case "$SESSION_TYPE" in
         wayland)
             wl-copy "$1"
+            if [[ "$PASTE_METHOD" == "shift_insert" ]]; then
+                # Shift+Insert may rely on the primary selection.
+                wl-copy --primary "$1"
+            fi
             ;;
         *)
-            echo -n "$1" | xsel -ib
+            printf '%s' "$1" | xsel -ib
+            if [[ "$PASTE_METHOD" == "shift_insert" ]]; then
+                # Shift+Insert may rely on the primary selection.
+                printf '%s' "$1" | xsel -ip
+            fi
             ;;
     esac
 }
@@ -98,11 +107,26 @@ autopaste() {
     if (( AUTOPASTE )); then
         case "$SESSION_TYPE" in
             wayland)
-                # ydotool keycodes: 37=LCtrl, 55=V (kernel keycodes)
-                ydotool key 37:1 55:1 55:0 37:0
+                case "$PASTE_METHOD" in
+                    shift_insert)
+                        # ydotool uses Linux evdev keycodes: 42=LeftShift, 110=Insert
+                        ydotool key 42:1 110:1 110:0 42:0
+                        ;;
+                    *)
+                        # ydotool uses Linux evdev keycodes: 29=LeftCtrl, 47=V
+                        ydotool key 29:1 47:1 47:0 29:0
+                        ;;
+                esac
                 ;;
             *)
-                xdotool key ctrl+v
+                case "$PASTE_METHOD" in
+                    shift_insert)
+                        xdotool key shift+Insert
+                        ;;
+                    *)
+                        xdotool key ctrl+v
+                        ;;
+                esac
                 ;;
         esac
     fi

@@ -18,6 +18,7 @@ WHISPER_DEVICE=0
 WHISPER_THREADS=4
 WHISPER_LANGUAGE="en"
 AUTOPASTE=1
+PASTE_METHOD="ctrl_v"
 SILENCE_DURATION=3.0
 SILENCE_THRESHOLD=3
 WHISPER_SERVER=""
@@ -386,6 +387,26 @@ select_language() {
 }
 
 # ============================================================
+# PASTE METHOD SELECTION
+# ============================================================
+select_paste_method() {
+    header "Paste Method"
+
+    local options=(
+        "ctrl_v       — use Ctrl+V (for GUI applications)"
+        "shift_insert — use Shift+Insert (for CLI; works with most GUI applications)"
+    )
+    prompt_choice "Select paste method" "${options[@]}"
+    local idx=$?
+    if (( idx == 0 )); then
+        PASTE_METHOD="ctrl_v"
+    else
+        PASTE_METHOD="shift_insert"
+    fi
+    info "Paste method: $PASTE_METHOD"
+}
+
+# ============================================================
 # KEYBINDING SETUP
 # ============================================================
 setup_keybinding() {
@@ -548,6 +569,9 @@ WHISPER_LANGUAGE="$WHISPER_LANGUAGE"
 # Automatically paste transcription at cursor (1=yes, 0=no)
 AUTOPASTE=$AUTOPASTE
 
+# Paste method for autopaste ("ctrl_v" or "shift_insert")
+PASTE_METHOD="$PASTE_METHOD"
+
 # Silence duration (seconds) before recording auto-stops
 SILENCE_DURATION=$SILENCE_DURATION
 
@@ -570,6 +594,7 @@ detect_threads
 select_model
 select_backend
 select_language
+select_paste_method
 setup_keybinding
 write_config
 
