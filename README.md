@@ -55,7 +55,9 @@ whisper-toggle-setup
 - **X11 + Wayland** — auto-detects session, uses the right clipboard/paste tools
 - **Interactive setup** — detects GPU, downloads models, configures your WM
 - **XDG compliant** — config in `~/.config/`, models in `~/.local/share/`, temp in `/dev/shm/`
-- **No daemon** — server starts and stops per-transcription, zero background footprint
+- **Ordered queue** — start the next recording while the previous one is still transcribing; results are pasted strictly in recording order
+- **Per-shortcut language** — `whisper-toggle de`, `whisper-toggle en`, … skip auto-detection; no argument uses `WHISPER_LANGUAGE`
+- **Shared server** — one `whisper-server` with the model loaded, started on demand and stopped after `WHISPER_SERVER_IDLE` seconds
 - **Smart silence detection** — recording stops automatically when you stop speaking
 - **Post-processing** — strips non-speech markers, trims whitespace, capitalizes
 
@@ -114,6 +116,54 @@ Settings > Keyboard > Custom Shortcuts
 System Settings > Shortcuts > Custom Shortcuts > Add > Command/URL
 </details>
 
+## Language shortcuts
+
+`whisper-toggle [LANGUAGE]` takes any language code whisper understands (`de`, `en`, `fr`, …, or `auto`). Without an argument, `WHISPER_LANGUAGE` from the config applies. A fixed language is faster than `auto`, which needs an additional detection pass. Bind one shortcut per language you dictate in:
+
+| Command | Language |
+|:--------|:---------|
+| `whisper-toggle de` | German |
+| `whisper-toggle en` | English |
+| `whisper-toggle` | `WHISPER_LANGUAGE` from the config |
+
+A press that **ends** a recording ignores its argument: the language is the one the recording started with. The script does not set any shortcuts; choose keys that don't collide with ones you already use.
+
+<details>
+<summary><b>GNOME: one custom shortcut per language</b></summary>
+
+Settings > Keyboard > Custom Shortcuts, one entry per command above. Or from a terminal (replace the bindings with your own, in gsettings notation such as `<Super><Alt>d`):
+
+```bash
+add_whisper_shortcut() {   # usage: add_whisper_shortcut NAME COMMAND BINDING
+    local key=org.gnome.settings-daemon.plugins.media-keys
+    local path="/$(tr . / <<< "$key")/custom-keybindings/whisper-$1/"
+    local item="$key.custom-keybinding:$path"
+    local list
+    gsettings set "$item" name "Whisper $1"
+    gsettings set "$item" command "$2"
+    gsettings set "$item" binding "$3"
+    list="$(gsettings get "$key" custom-keybindings)"
+    case "$list" in
+        *"$path"*) ;;
+        "@as []"|"[]") gsettings set "$key" custom-keybindings "['$path']" ;;
+        *) gsettings set "$key" custom-keybindings "${list%]}, '$path']" ;;
+    esac
+}
+
+add_whisper_shortcut de      "whisper-toggle de" "<YOUR><BINDING>"
+add_whisper_shortcut en      "whisper-toggle en" "<YOUR><BINDING>"
+add_whisper_shortcut default "whisper-toggle"    "<YOUR><BINDING>"
+```
+
+If a key is already taken (GNOME uses some for switching input sources, for example), free it in Settings > Keyboard first.
+</details>
+
+For i3, sway and Hyprland add one `bindsym` / `bind` line per language, e.g. `bindsym <your keys> exec whisper-toggle de`.
+
+## Queue
+
+Each recording gets a ticket number and its own audio file. You can start the next recording while the previous one is still transcribing; each result is pasted only after every earlier recording has been pasted, so the order always matches the order you spoke in, even if a later, shorter recording finishes transcribing first. Tickets belong to a process; if a run is killed, its ticket stops blocking the others. A second press while a recording is running ends it; with no recording running, it starts a new one.
+
 ## Configuration
 
 `~/.config/whisper-toggle/whisper-toggle.conf`
@@ -126,7 +176,9 @@ WHISPER_MODEL="~/.local/share/whisper-toggle/models/ggml-small.en.bin"
 WHISPER_PORT=58080             # Server backend port
 WHISPER_DEVICE=0               # GPU index (-1 for CPU-only)
 WHISPER_THREADS=4              # CPU threads for inference
-WHISPER_LANGUAGE="en"          # Language code or "auto"
+WHISPER_LANGUAGE="en"          # Default language code or "auto" (used when no argument is given)
+WHISPER_SERVER_IDLE=300        # Seconds the server stays loaded after the last recording
+WHISPER_REQUEST_TIMEOUT=300    # Max seconds for one transcription request
 AUTOPASTE=1                    # Auto-paste after transcription
 PASTE_METHOD="ctrl_v"          # "ctrl_v" or "shift_insert"
 SILENCE_DURATION=3.0           # Seconds of silence before auto-stop
@@ -151,12 +203,12 @@ Models are downloaded by the setup wizard to `~/.local/share/whisper-toggle/mode
 ### `server` (recommended)
 
 ```
-[key press] ──> whisper-server starts ──> model loads ──> ┐
-                recording starts ──────> audio captured ──> inference ──> paste
-                                                           server killed
+[key press] ──> recording starts ──────> audio captured ──> inference ──> paste
+            └─> whisper-server starts (if not running) ──> model loads ──┘
+                                        idle for WHISPER_SERVER_IDLE ──> server stops
 ```
 
-The model loads **in parallel** with your speech. No persistent daemon — the server is started and killed per use.
+The server is started in the background right after the recorder, so it never delays the recording, and a transcription waits for it instead of failing. One server is shared by all recordings and stopped after `WHISPER_SERVER_IDLE` seconds without a recording in flight. It is only ever stopped via its remembered PID, never by name or port, and never while a recording is queued.
 
 ### `cli`
 
