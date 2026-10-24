@@ -9,10 +9,18 @@
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/whisper-toggle"
 CONF_FILE="$CONF_DIR/whisper-toggle.conf"
-LOCKFILE="/tmp/whisper-toggle.lock"
-LOGFILE="/tmp/whisper-toggle.log"
-DEBOUNCE_FILE="/tmp/whisper-toggle-debounce"
-AUDIO_FILE="/dev/shm/whisper-toggle.wav"
+SELF="$(readlink -f "$0")"
+# Runtime state (tickets, recorder/server PIDs). WHISPER_TOGGLE_* variables
+# exist so the test suite can run isolated from a real installation.
+STATE_DIR="${WHISPER_TOGGLE_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/whisper-toggle}"
+LOCK_FILE="$STATE_DIR/lock"
+LOGFILE="${WHISPER_TOGGLE_LOG:-/tmp/whisper-toggle.log}"
+DEBOUNCE_FILE="$STATE_DIR/debounce"
+AUDIO_DIR="${WHISPER_TOGGLE_AUDIO_DIR:-/dev/shm}"
+MY_TICKET=""
+REC_PID=""
+AUDIO_FILE=""
+RAW=""
 
 # --- Defaults (overridden by config) ---
 BACKEND="server"
@@ -23,6 +31,8 @@ WHISPER_THREADS=4
 WHISPER_LANGUAGE="en"
 AUTOPASTE=1
 PASTE_METHOD="ctrl_v"
+WHISPER_SERVER_IDLE=300
+WHISPER_REQUEST_TIMEOUT=300
 SILENCE_DURATION=3.0
 SILENCE_THRESHOLD=3
 WHISPER_SERVER=""
@@ -64,7 +74,7 @@ SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
 
 # --- Logging helper ---
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S'): $*" >> "$LOGFILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): ${MY_TICKET:+[#$MY_TICKET] }$*" >> "$LOGFILE"
 }
 
 # --- Notification helper ---
@@ -73,6 +83,240 @@ notify() {
     local icon="${3:-dialog-information}"
     notify-send -t 1500 -u "$urgency" "Whisper Toggle" "$1" -i "$icon" 2>/dev/null || true
 }
+
+# --- Process identity ---
+# A PID alone can be recycled, so every remembered process is stored as
+# "PID STARTTIME" (field 22 of /proc/PID/stat) and only counts as alive if
+# both still match. Zombies count as dead.
+proc_start() {
+    local stat
+    stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+    stat="${stat##*) }"
+    # shellcheck disable=SC2086
+    set -- $stat
+    [[ "$1" == Z || "$1" == X ]] && return 1
+    echo "${20}"
+}
+
+pid_record() { echo "$1 $(proc_start "$1")"; }
+
+# record_alive "PID STARTTIME [...]"
+record_alive() {
+    local pid="${1%% *}" start now
+    start="${1#* }"
+    start="${start%% *}"
+    [[ -n "$pid" && -n "$start" ]] || return 1
+    now="$(proc_start "$pid")" && [[ "$now" == "$start" ]]
+}
+
+# Kill exactly the process remembered in a record, never anything else.
+kill_record() {
+    local sig="$1" rec="$2"
+    record_alive "$rec" && kill "-$sig" "${rec%% *}" 2>/dev/null
+}
+
+# --- State directory and lock ---
+# All queue/recorder/server bookkeeping happens under one flock. The lock is
+# only the mutex; the order itself comes from the ticket numbers below.
+# Children are started with fd 9 closed so they never hold the lock.
+mkdir -p -m 700 "$STATE_DIR/tickets"
+
+locked() { ( flock 9 || exit 1; "$@" ) 9>"$LOCK_FILE"; }
+lock_acquire() { exec 9>"$LOCK_FILE"; flock 9; }
+lock_release() { exec 9>&-; }
+
+# --- Tickets ---
+# Every recording takes the next ticket number under the lock when it starts.
+# A run may only paste once no live ticket with a smaller number exists, so
+# pastes happen in recording order no matter which transcription finishes
+# first. A ticket whose owner PID is dead is removed and no longer blocks.
+ticket_path() { printf '%s/tickets/%012d' "$STATE_DIR" "$1"; }
+
+# Prints the live ticket numbers (ascending) that are smaller than $1 (all if
+# omitted), removing tickets of dead owners. Lock must be held.
+_live_tickets() {
+    local f n limit="${1:-0}" rec
+    for f in "$STATE_DIR"/tickets/*; do
+        [[ -e "$f" ]] || continue
+        n=$((10#${f##*/}))
+        (( limit > 0 && n >= limit )) && break
+        rec="$(cat "$f" 2>/dev/null)"
+        if record_alive "$rec"; then
+            echo "$n"
+        else
+            rm -f "$f" "$AUDIO_DIR"/whisper-toggle-"$n"-*.wav
+            log "Dropped dead ticket #$n"
+        fi
+    done
+}
+
+_take_ticket() {
+    local n=0 last f
+    [[ -f "$STATE_DIR/counter" ]] && n="$(cat "$STATE_DIR/counter" 2>/dev/null)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    # Never go below an existing ticket, even if the counter file was damaged
+    for f in "$STATE_DIR"/tickets/*; do
+        [[ -e "$f" ]] || continue
+        last=$((10#${f##*/}))
+        (( last > n )) && n=$last
+    done
+    n=$((n + 1))
+    echo "$n" > "$STATE_DIR/counter.tmp" && mv -f "$STATE_DIR/counter.tmp" "$STATE_DIR/counter"
+    pid_record $$ > "$(ticket_path "$n")"
+    echo "$n"
+}
+
+_release_ticket() {
+    rm -f "$(ticket_path "$MY_TICKET")"
+    _clear_rec
+}
+
+# Forget the recorder if it is ours
+_clear_rec() {
+    local rec_ticket
+    [[ -f "$STATE_DIR/rec.pid" ]] || return 0
+    read -r _ _ rec_ticket < "$STATE_DIR/rec.pid"
+    [[ "$rec_ticket" == "$MY_TICKET" ]] && rm -f "$STATE_DIR/rec.pid"
+    return 0
+}
+
+# Block until every smaller ticket is gone (finished or owner dead)
+wait_for_turn() {
+    local ahead
+    while :; do
+        ahead="$(locked _live_tickets "$MY_TICKET")"
+        [[ -z "$ahead" ]] && return 0
+        sleep 0.05
+    done
+}
+
+cleanup() {
+    lock_release
+    [[ -n "$REC_PID" ]] && kill_record TERM "$(pid_record "$REC_PID")"
+    [[ -n "$MY_TICKET" ]] && locked _release_ticket
+    [[ -n "$AUDIO_FILE" ]] && rm -f "$AUDIO_FILE"
+}
+
+# --- whisper-server lifecycle ---
+# One server with a loaded model is shared by all runs. It is started on
+# demand and stopped by a reaper after WHISPER_SERVER_IDLE seconds without a
+# live ticket. Both only ever signal the PID remembered in server.pid.
+server_sig() {
+    echo "$WHISPER_SERVER|$WHISPER_MODEL|$WHISPER_PORT|$WHISPER_DEVICE|$WHISPER_THREADS"
+}
+
+# Prints the remembered server record if it is alive (lock must be held)
+_server_record() {
+    local rec
+    [[ -f "$STATE_DIR/server.pid" ]] || return 1
+    rec="$(sed -n 1p "$STATE_DIR/server.pid")"
+    record_alive "$rec" || return 1
+    echo "$rec"
+}
+
+_server_alive() { _server_record >/dev/null; }
+
+_ensure_server() {
+    local rec old_sig spid rrec
+    if rec="$(_server_record)"; then
+        old_sig="$(sed -n 2p "$STATE_DIR/server.pid")"
+        if [[ "$old_sig" != "$(server_sig)" ]]; then
+            if (( $(_live_tickets | wc -l) <= 1 )); then
+                log "Server settings changed, restarting server"
+                kill_record TERM "$rec"
+                rm -f "$STATE_DIR/server.pid"
+            else
+                log "Server settings changed, keeping running server until the queue is empty"
+                return 0
+            fi
+        else
+            # Server fine; make sure its reaper still exists
+            rrec="$(cat "$STATE_DIR/reaper.pid" 2>/dev/null)"
+            record_alive "$rrec" || _start_reaper "${rec%% *}"
+            return 0
+        fi
+    fi
+
+    # Own session so keypresses/terminal signals don't reach it
+    setsid "$WHISPER_SERVER" \
+        -m "$WHISPER_MODEL" \
+        --port "$WHISPER_PORT" \
+        --device "$WHISPER_DEVICE" \
+        -t "$WHISPER_THREADS" \
+        -nt \
+        >>"$LOGFILE" 2>&1 </dev/null 9>&- &
+    spid=$!
+    { pid_record "$spid"; server_sig; } > "$STATE_DIR/server.pid"
+    log "Started whisper-server (PID $spid)"
+    _start_reaper "$spid"
+}
+
+_start_reaper() {
+    local rpid
+    setsid "$SELF" --reaper "$1" >>"$LOGFILE" 2>&1 </dev/null 9>&- &
+    rpid=$!
+    pid_record "$rpid" > "$STATE_DIR/reaper.pid"
+}
+
+# One reaper decision, under the lock, so a new ticket can never appear
+# between "queue is empty" and "kill". Exit status: 0 keep going, 1 stop.
+# $1 = server PID the reaper belongs to, $2 = seconds since last activity.
+_reaper_step() {
+    local rec
+    rec="$(_server_record)" || return 1
+    [[ "${rec%% *}" == "$1" ]] || return 1
+    if [[ -n "$(_live_tickets)" ]]; then
+        echo busy
+        return 0
+    fi
+    if (( $2 >= WHISPER_SERVER_IDLE )); then
+        log "whisper-server idle for ${2}s, stopping (PID $1)"
+        kill_record TERM "$rec"
+        rm -f "$STATE_DIR/server.pid" "$STATE_DIR/reaper.pid"
+        return 1
+    fi
+    return 0
+}
+
+run_reaper() {
+    local spid="$1" last now out
+    last="$(date +%s)"
+    while :; do
+        sleep 1
+        now="$(date +%s)"
+        out="$(locked _reaper_step "$spid" $((now - last)))" || exit 0
+        [[ "$out" == busy ]] && last="$now"
+    done
+}
+
+# Wait for the server to accept requests. A server that is still loading its
+# model is waited for; a server that died is restarted once.
+wait_for_server() {
+    local deadline=$((SECONDS + 120)) restarted=0
+    while (( SECONDS < deadline )); do
+        if curl -s -f -o /dev/null "http://127.0.0.1:$WHISPER_PORT" 2>/dev/null; then
+            return 0
+        fi
+        if ! locked _server_alive; then
+            if (( restarted )); then
+                log "ERROR: whisper-server exited prematurely"
+                return 1
+            fi
+            restarted=1
+            log "whisper-server not running, restarting"
+            locked _ensure_server
+        fi
+        sleep 0.1
+    done
+    log "ERROR: whisper-server not ready after 120s"
+    return 1
+}
+
+# --- Internal: idle reaper for the shared whisper-server ---
+if [[ "${1:-}" == "--reaper" ]]; then
+    run_reaper "$2"
+    exit 0
+fi
 
 # --- Arguments ---
 case "${1:-}" in
@@ -174,161 +418,142 @@ postprocess() {
     echo "$str"
 }
 
-# --- Transcribe via server backend ---
-transcribe_server() {
-    if [[ -z "$WHISPER_SERVER" ]]; then
-        notify "whisper-server not found" "critical" "dialog-error"
-        log "ERROR: whisper-server not found (set WHISPER_SERVER in config)"
-        exit 1
-    fi
-
-    # Start server in background — model loads while user speaks
-    local lang_args=() lang_form=()
-    if [[ -n "$WHISPER_LANGUAGE" ]]; then
-        lang_args=(-l "$WHISPER_LANGUAGE")
-        lang_form=(-F "language=$WHISPER_LANGUAGE")
-    fi
-    # Start in its own process group (setsid) so keypresses don't SIGINT it
-    setsid "$WHISPER_SERVER" \
-        -m "$WHISPER_MODEL" \
-        --port "$WHISPER_PORT" \
-        --device "$WHISPER_DEVICE" \
-        -t "$WHISPER_THREADS" \
-        -nt \
-        "${lang_args[@]}" \
-        >>"$LOGFILE" 2>&1 &
-    local server_pid=$!
-    log "Started whisper-server (PID $server_pid)"
-
-    # Record audio
-    notify "Recording..." "low" "microphone-sensitivity-high"
+# --- Recording ---
+# Starts the recorder; must be called with the lock held and MY_TICKET set.
+_start_recorder() {
     rec -q -t wav "$AUDIO_FILE" rate 16k \
         silence 1 0.1 "${SILENCE_THRESHOLD}%" 1 "$SILENCE_DURATION" "${SILENCE_THRESHOLD}%" \
-        2>/dev/null || true
-
-    # Recording done — clear lock so second press won't interfere with transcription
-    rm -f "$LOCKFILE"
-    notify "Transcribing..." "low" "audio-x-generic"
-
-    # Wait for server to be ready (up to 30s)
-    local server_ready=0
-    for _ in $(seq 1 300); do
-        # Bail early if server process died
-        if ! kill -0 "$server_pid" 2>/dev/null; then
-            log "ERROR: whisper-server exited prematurely"
-            break
-        fi
-        if curl -s -f -o /dev/null "http://127.0.0.1:$WHISPER_PORT" 2>/dev/null; then
-            server_ready=1
-            break
-        fi
-        sleep 0.1
-    done
-
-    local str=""
-    if (( server_ready )); then
-        log "Server ready, sending inference request..."
-        # Transcribe
-        str=$(curl -S -s "http://127.0.0.1:$WHISPER_PORT/inference" \
-            -H "Content-Type: multipart/form-data" \
-            -F file="@$AUDIO_FILE" \
-            "${lang_form[@]}" \
-            -F temperature="0.0" \
-            -F temperature_inc="0.2" \
-            -F response_format="text" 2>/dev/null) || true
-        log "Inference response: '$str'"
-    else
-        log "ERROR: whisper-server failed to start (check log above)"
-        notify "Server failed to start — check $LOGFILE" "critical" "dialog-error"
-    fi
-
-    # Kill server — pkill by port since setsid detaches from our process tree
-    kill "$server_pid" 2>/dev/null || true
-    # Also kill any whisper-server listening on our port, in case PID tracking lost it
-    pkill -f "whisper-server.*--port $WHISPER_PORT" 2>/dev/null || true
-
-    echo "$str"
+        2>/dev/null 9>&- &
+    REC_PID=$!
+    echo "$(pid_record "$REC_PID") $MY_TICKET" > "$STATE_DIR/rec.pid"
 }
 
-# --- Transcribe via CLI backend ---
+# --- Transcribe via server backend (result in $RAW) ---
+transcribe_server() {
+    local lang_form=()
+    [[ -n "$WHISPER_LANGUAGE" ]] && lang_form=(-F "language=$WHISPER_LANGUAGE")
+
+    if ! wait_for_server; then
+        notify "Server failed to start — check $LOGFILE" "critical" "dialog-error"
+        return
+    fi
+    log "Server ready, sending inference request (language: ${WHISPER_LANGUAGE:-default})..."
+    RAW="$(curl -S -s --max-time "$WHISPER_REQUEST_TIMEOUT" \
+        "http://127.0.0.1:$WHISPER_PORT/inference" \
+        -H "Content-Type: multipart/form-data" \
+        -F file="@$AUDIO_FILE" \
+        "${lang_form[@]}" \
+        -F temperature="0.0" \
+        -F temperature_inc="0.2" \
+        -F response_format="text" 2>>"$LOGFILE")" || log "ERROR: inference request failed"
+    log "Inference response: '$RAW'"
+}
+
+# --- Transcribe via CLI backend (result in $RAW) ---
 transcribe_cli() {
-    if [[ -z "$WHISPER_CLI" ]]; then
-        notify "whisper-cli not found" "critical" "dialog-error"
-        log "ERROR: whisper-cli not found (set WHISPER_CLI in config)"
-        exit 1
-    fi
-
-    # Record audio
-    notify "Recording..." "low" "microphone-sensitivity-high"
-    rec -q -t wav "$AUDIO_FILE" rate 16k \
-        silence 1 0.1 "${SILENCE_THRESHOLD}%" 1 "$SILENCE_DURATION" "${SILENCE_THRESHOLD}%" \
-        2>/dev/null || true
-
-    # Recording done — clear lock so second press won't interfere with transcription
-    rm -f "$LOCKFILE"
-    notify "Transcribing..." "low" "audio-x-generic"
-
     local lang_args=()
-    if [[ -n "$WHISPER_LANGUAGE" ]]; then
-        lang_args=(-l "$WHISPER_LANGUAGE")
-    fi
+    [[ -n "$WHISPER_LANGUAGE" ]] && lang_args=(-l "$WHISPER_LANGUAGE")
 
-    local str
-    str=$("$WHISPER_CLI" \
+    RAW="$("$WHISPER_CLI" \
         -t "$WHISPER_THREADS" \
         -nt \
         --device "$WHISPER_DEVICE" \
         -m "$WHISPER_MODEL" \
         "${lang_args[@]}" \
-        -f "$AUDIO_FILE" 2>/dev/null) || true
-
-    echo "$str"
+        -f "$AUDIO_FILE" 2>/dev/null)" || true
 }
 
 # --- Main toggle logic ---
 log "Toggle called"
 
-if [[ -f "$LOCKFILE" ]]; then
-    # Second press: stop recording early
-    log "Stopping recording (lock exists)"
-    rm -f "$LOCKFILE"
-    pkill -x rec 2>/dev/null || true
-    # The first invocation's pipeline continues from where rec stopped
-else
-    # First press: start recording + transcription pipeline
-    log "Starting recording"
-    touch "$LOCKFILE"
-    rm -f "$AUDIO_FILE"
-
-    # Run transcription (lockfile removed as soon as recording ends)
-    raw=""
-    case "$BACKEND" in
-        server)
-            raw="$(transcribe_server)"
-            ;;
-        cli)
-            raw="$(transcribe_cli)"
-            ;;
-        *)
-            notify "Unknown backend: $BACKEND" "critical" "dialog-error"
-            rm -f "$LOCKFILE"
+case "$BACKEND" in
+    server)
+        if [[ -z "$WHISPER_SERVER" ]]; then
+            notify "whisper-server not found" "critical" "dialog-error"
+            log "ERROR: whisper-server not found (set WHISPER_SERVER in config)"
             exit 1
-            ;;
-    esac
+        fi
+        ;;
+    cli)
+        if [[ -z "$WHISPER_CLI" ]]; then
+            notify "whisper-cli not found" "critical" "dialog-error"
+            log "ERROR: whisper-cli not found (set WHISPER_CLI in config)"
+            exit 1
+        fi
+        ;;
+    *)
+        notify "Unknown backend: $BACKEND" "critical" "dialog-error"
+        exit 1
+        ;;
+esac
 
-    # Post-process
-    result="$(postprocess "$raw")"
+trap cleanup EXIT
+trap 'exit 143' TERM INT HUP
 
-    if [[ -n "$result" ]]; then
-        clip_copy "$result"
-        autopaste
-        notify "$result" "low" "edit-paste"
-        log "Transcribed: $result"
-    else
-        notify "No speech detected" "low" "dialog-warning"
-        log "No speech detected"
+# rec.pid may only be trusted if the recorder and the run that owns it are alive
+_active_recorder() {
+    local rec rec_ticket
+    [[ -f "$STATE_DIR/rec.pid" ]] || return 1
+    rec="$(cat "$STATE_DIR/rec.pid")"
+    record_alive "$rec" || return 1
+    read -r _ _ rec_ticket <<< "$rec"
+    if ! record_alive "$(cat "$(ticket_path "$rec_ticket")" 2>/dev/null)"; then
+        # Orphaned recorder of a dead run: nobody would transcribe it
+        log "Killing orphaned recorder of dead ticket #$rec_ticket"
+        kill_record TERM "$rec"
+        rm -f "$STATE_DIR/rec.pid"
+        return 1
     fi
+}
 
-    rm -f "$LOCKFILE"
-    log "Done"
+lock_acquire
+if _active_recorder; then
+    # A recording is running: this press ends it. Only that recorder is
+    # signalled, by its remembered PID. The run that started it carries on.
+    log "Stopping recording"
+    kill_record TERM "$(cat "$STATE_DIR/rec.pid")"
+    lock_release
+    exit 0
 fi
+
+# Start a new recording. It gets its own ticket and audio file, so it may
+# begin while earlier recordings are still being transcribed.
+MY_TICKET="$(_take_ticket)"
+AUDIO_FILE="$AUDIO_DIR/whisper-toggle-$MY_TICKET-$$.wav"
+rm -f "$AUDIO_FILE"
+_start_recorder
+lock_release
+log "Starting recording (language: ${WHISPER_LANGUAGE:-default})"
+notify "Recording..." "low" "microphone-sensitivity-high"
+
+# Server start happens after the recorder is running, so it never delays it
+if [[ "$BACKEND" == server ]]; then
+    locked _ensure_server
+fi
+
+wait "$REC_PID"
+REC_PID=""
+locked _clear_rec
+notify "Transcribing..." "low" "audio-x-generic"
+
+case "$BACKEND" in
+    server) transcribe_server ;;
+    cli)    transcribe_cli ;;
+esac
+
+result="$(postprocess "$RAW")"
+
+# Wait until every earlier recording has been pasted (or its run is dead)
+wait_for_turn
+
+if [[ -n "$result" ]]; then
+    clip_copy "$result"
+    autopaste
+    notify "$result" "low" "edit-paste"
+    log "Transcribed: $result"
+else
+    notify "No speech detected" "low" "dialog-warning"
+    log "No speech detected"
+fi
+
+log "Done"
