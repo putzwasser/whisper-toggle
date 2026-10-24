@@ -7,6 +7,9 @@
 # License: MIT
 
 
+# Transcripts end up in the log and clipboard files: keep everything private
+umask 077
+
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/whisper-toggle"
 CONF_FILE="$CONF_DIR/whisper-toggle.conf"
 SELF="$(readlink -f "$0")"
@@ -21,6 +24,7 @@ MY_TICKET=""
 REC_PID=""
 AUDIO_FILE=""
 RAW=""
+FAILED=""
 
 # --- Defaults (overridden by config) ---
 BACKEND="server"
@@ -356,10 +360,10 @@ date +%s%N > "$DEBOUNCE_FILE"
 clip_copy() {
     case "$SESSION_TYPE" in
         wayland)
-            wl-copy "$1"
+            wl-copy -- "$1"
             if [[ "$PASTE_METHOD" == "shift_insert" ]]; then
                 # Shift+Insert may rely on the primary selection.
-                wl-copy --primary "$1"
+                wl-copy --primary -- "$1"
             fi
             ;;
         *)
@@ -405,8 +409,8 @@ autopaste() {
 postprocess() {
     local str="$1"
     # Strip whisper non-speech markers like (wind blowing) or [BLANK_AUDIO]
-    str="${str//(*/}"
-    str="${str//[*/}"
+    # (bounded, so text after a stray bracket is kept)
+    str="$(printf '%s' "$str" | sed -E 's/\[[^]]*\]//g; s/\([^)]*\)//g')"
     # Trim leading whitespace
     str="$(printf '%s' "$str" | sed 's/^[[:space:]]*//')"
     # Flatten transcript line breaks
@@ -435,7 +439,7 @@ transcribe_server() {
 
     if ! wait_for_server; then
         notify "Server failed to start — check $LOGFILE" "critical" "dialog-error"
-        return
+        return 1
     fi
     log "Server ready, sending inference request (language: ${WHISPER_LANGUAGE:-default})..."
     RAW="$(curl -S -s --max-time "$WHISPER_REQUEST_TIMEOUT" \
@@ -445,7 +449,11 @@ transcribe_server() {
         "${lang_form[@]}" \
         -F temperature="0.0" \
         -F temperature_inc="0.2" \
-        -F response_format="text" 2>>"$LOGFILE")" || log "ERROR: inference request failed"
+        -F response_format="text" 2>>"$LOGFILE")" || {
+        log "ERROR: inference request failed"
+        notify "Transcription request failed — check $LOGFILE" "critical" "dialog-error"
+        return 1
+    }
     log "Inference response: '$RAW'"
 }
 
@@ -537,7 +545,7 @@ locked _clear_rec
 notify "Transcribing..." "low" "audio-x-generic"
 
 case "$BACKEND" in
-    server) transcribe_server ;;
+    server) transcribe_server || FAILED=1 ;;
     cli)    transcribe_cli ;;
 esac
 
@@ -551,7 +559,7 @@ if [[ -n "$result" ]]; then
     autopaste
     notify "$result" "low" "edit-paste"
     log "Transcribed: $result"
-else
+elif [[ -z "$FAILED" ]]; then
     notify "No speech detected" "low" "dialog-warning"
     log "No speech detected"
 fi

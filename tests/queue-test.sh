@@ -29,6 +29,7 @@ S
 cat > "$T/bin/wl-copy" <<'S'
 #!/bin/bash
 [[ "$1" == --primary ]] && exit 0
+[[ "$1" == -- ]] && shift
 printf '%s' "$1" > "$STUB_DIR/clipboard"
 S
 cat > "$T/bin/ydotool" <<'S'
