@@ -1,5 +1,8 @@
 #!/bin/bash
 # whisper-toggle — press once to record, press again to transcribe and paste
+# Usage: whisper-toggle [LANGUAGE]
+#   LANGUAGE  any whisper language code (de, en, fr, auto, ...); overrides
+#             WHISPER_LANGUAGE from the config for this recording only.
 # https://github.com/zweck/whisper-toggle
 # License: MIT
 
@@ -70,6 +73,28 @@ notify() {
     local icon="${3:-dialog-information}"
     notify-send -t 1500 -u "$urgency" "Whisper Toggle" "$1" -i "$icon" 2>/dev/null || true
 }
+
+# --- Arguments ---
+case "${1:-}" in
+    -h|--help)
+        echo "Usage: whisper-toggle [LANGUAGE]"
+        echo "  LANGUAGE  whisper language code (de, en, auto, ...); default: WHISPER_LANGUAGE from config"
+        exit 0
+        ;;
+esac
+if [[ $# -gt 1 ]]; then
+    echo "whisper-toggle: too many arguments (usage: whisper-toggle [LANGUAGE])" >&2
+    exit 2
+fi
+if [[ -n "${1:-}" ]]; then
+    # Pass any code through, but keep it a plain word: it ends up on command lines and in a curl form field.
+    if [[ ! "$1" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]]; then
+        notify "Invalid language: $1" "critical" "dialog-error"
+        log "ERROR: invalid language argument '$1'"
+        exit 2
+    fi
+    WHISPER_LANGUAGE="$1"
+fi
 
 # --- Debounce (500ms) ---
 if [[ -f "$DEBOUNCE_FILE" ]]; then
@@ -158,19 +183,19 @@ transcribe_server() {
     fi
 
     # Start server in background — model loads while user speaks
-    local lang_flag=""
-    if [[ "$WHISPER_LANGUAGE" != "" ]]; then
-        lang_flag="-l $WHISPER_LANGUAGE"
+    local lang_args=() lang_form=()
+    if [[ -n "$WHISPER_LANGUAGE" ]]; then
+        lang_args=(-l "$WHISPER_LANGUAGE")
+        lang_form=(-F "language=$WHISPER_LANGUAGE")
     fi
     # Start in its own process group (setsid) so keypresses don't SIGINT it
-    # shellcheck disable=SC2086
     setsid "$WHISPER_SERVER" \
         -m "$WHISPER_MODEL" \
         --port "$WHISPER_PORT" \
         --device "$WHISPER_DEVICE" \
         -t "$WHISPER_THREADS" \
         -nt \
-        $lang_flag \
+        "${lang_args[@]}" \
         >>"$LOGFILE" 2>&1 &
     local server_pid=$!
     log "Started whisper-server (PID $server_pid)"
@@ -207,6 +232,7 @@ transcribe_server() {
         str=$(curl -S -s "http://127.0.0.1:$WHISPER_PORT/inference" \
             -H "Content-Type: multipart/form-data" \
             -F file="@$AUDIO_FILE" \
+            "${lang_form[@]}" \
             -F temperature="0.0" \
             -F temperature_inc="0.2" \
             -F response_format="text" 2>/dev/null) || true
@@ -242,19 +268,18 @@ transcribe_cli() {
     rm -f "$LOCKFILE"
     notify "Transcribing..." "low" "audio-x-generic"
 
-    local lang_flag=""
-    if [[ "$WHISPER_LANGUAGE" != "" ]]; then
-        lang_flag="-l $WHISPER_LANGUAGE"
+    local lang_args=()
+    if [[ -n "$WHISPER_LANGUAGE" ]]; then
+        lang_args=(-l "$WHISPER_LANGUAGE")
     fi
 
     local str
-    # shellcheck disable=SC2086
     str=$("$WHISPER_CLI" \
         -t "$WHISPER_THREADS" \
         -nt \
         --device "$WHISPER_DEVICE" \
         -m "$WHISPER_MODEL" \
-        $lang_flag \
+        "${lang_args[@]}" \
         -f "$AUDIO_FILE" 2>/dev/null) || true
 
     echo "$str"
