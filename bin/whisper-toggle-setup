@@ -17,6 +17,7 @@ WHISPER_PORT=58080
 WHISPER_DEVICE=0
 WHISPER_THREADS=4
 WHISPER_LANGUAGE="en"
+WHISPER_SERVER_IDLE=300
 AUTOPASTE=1
 PASTE_METHOD="ctrl_v"
 SILENCE_DURATION=3.0
@@ -395,9 +396,11 @@ select_backend() {
 # ============================================================
 select_language() {
     header "Language"
-    echo "  Common options: en, de, fr, es, it, pt, zh, ja, ko, auto"
+    echo "  This is the default language for 'whisper-toggle' without an argument."
+    echo "  Bind extra shortcuts to 'whisper-toggle <code>' for dedicated languages."
+    echo "  Common options: en, de, fr, es, it, pt, zh, ja, ko, auto (auto needs an extra pass)"
     echo ""
-    read -rp "Language [en]: " lang_input
+    read -rp "Default language [en]: " lang_input
     WHISPER_LANGUAGE="${lang_input:-en}"
     info "Language: $WHISPER_LANGUAGE"
 }
@@ -579,8 +582,16 @@ WHISPER_DEVICE=$WHISPER_DEVICE
 # Number of CPU threads for inference
 WHISPER_THREADS=$WHISPER_THREADS
 
-# Language for transcription (en, de, fr, etc. or "auto")
+# Default language when whisper-toggle is called without an argument
+# (en, de, fr, ... or "auto"). `whisper-toggle de` overrides it per recording.
 WHISPER_LANGUAGE="$WHISPER_LANGUAGE"
+
+# Seconds the shared whisper-server stays loaded after the last recording
+# (0 = stop as soon as nothing is queued)
+WHISPER_SERVER_IDLE=$WHISPER_SERVER_IDLE
+
+# Maximum seconds to wait for one transcription request
+WHISPER_REQUEST_TIMEOUT=300
 
 # Automatically paste transcription at cursor (1=yes, 0=no)
 AUTOPASTE=$AUTOPASTE
@@ -618,4 +629,5 @@ header "Setup Complete"
 info "Config: $CONF_FILE"
 info "Model:  $WHISPER_MODEL"
 info "Run 'whisper-toggle' to test (or use your keybinding)"
+info "Dedicated language shortcuts: bind 'whisper-toggle <code>' (see README, 'Language shortcuts')"
 echo ""
